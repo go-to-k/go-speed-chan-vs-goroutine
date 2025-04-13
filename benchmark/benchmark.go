@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
 // 処理するタスクの数
@@ -150,12 +151,52 @@ func UsingWorkerPoolWithChannel(numWorkers int) error {
 	return nil
 }
 
+// semaphoreを使用してgoroutineの同時実行数を制限する実装
+func UsingSemaphoreWithGoroutines(maxConcurrency int64) error {
+	// コンテキストを作成
+	ctx := context.Background()
+
+	// 同時実行数を制限するsemaphoreを作成
+	sem := semaphore.NewWeighted(maxConcurrency)
+
+	// 完了を待つためのWaitGroup
+	var wg sync.WaitGroup
+
+	// タスクごとにgoroutineを起動（semaphoreで同時実行数を制限）
+	for i := 0; i < numTasks; i++ {
+		i := i // ループ変数をキャプチャ
+		task := Task{
+			ID:   i,
+			Data: fmt.Sprintf("Task data %d", i),
+		}
+
+		// semaphoreの空きを待つ
+		if err := sem.Acquire(ctx, 1); err != nil {
+			return err
+		}
+
+		wg.Add(1)
+		go func() {
+			defer sem.Release(1)
+			defer wg.Done()
+
+			if err := processTask(task); err != nil {
+				log.Printf("Error processing task %d: %v", task.ID, err)
+			}
+		}()
+	}
+
+	// すべてのgoroutineの終了を待つ
+	wg.Wait()
+	return nil
+}
+
 // ベンチマークを実行する関数
 func Run() error {
 	fmt.Printf("CPUs: %d\n", runtime.NumCPU())
 	fmt.Printf("処理タスク数: %d\n\n", numTasks)
 
-	fmt.Println("1. 事前に1つのgoroutineを起動してチャネル経由で処理")
+	fmt.Println("1. 事前に1つのgoroutineを起動してチャネル経由でタスクを受け取り、errgroup.Goで並列処理")
 	start := time.Now()
 	if err := UsingSingleWorkerWithChannel(); err != nil {
 		return err
@@ -174,6 +215,14 @@ func Run() error {
 	fmt.Printf("3. %d個のワーカープールを使用したチャネル実装\n", numWorkers)
 	start = time.Now()
 	if err := UsingWorkerPoolWithChannel(numWorkers); err != nil {
+		return err
+	}
+	fmt.Printf("処理時間: %v\n\n", time.Since(start))
+
+	// 4つ目のアプローチ：semaphoreを使用した実装
+	fmt.Printf("4. semaphoreを使用して同時実行数を%dに制限\n", numWorkers)
+	start = time.Now()
+	if err := UsingSemaphoreWithGoroutines(int64(numWorkers)); err != nil {
 		return err
 	}
 	fmt.Printf("処理時間: %v\n\n", time.Since(start))

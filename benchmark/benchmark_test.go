@@ -1,6 +1,7 @@
 package benchmark
 
 import (
+	"runtime"
 	"testing"
 )
 
@@ -43,6 +44,34 @@ func BenchmarkWorkerPoolWithChannelVaryingWorkers(b *testing.B) {
 		b.Run(string("Workers"+string(rune(count+'0'))), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				if err := UsingWorkerPoolWithChannel(count); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// semaphoreを使用したベンチマーク
+func BenchmarkSemaphoreWithGoroutines(b *testing.B) {
+	numWorkers := int64(runtime.NumCPU()) // デフォルトはCPU数
+
+	b.Run("DefaultConcurrency", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if err := UsingSemaphoreWithGoroutines(numWorkers); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// 様々な同時実行数でのsemaphoreベンチマーク
+func BenchmarkSemaphoreWithVaryingConcurrency(b *testing.B) {
+	concurrencyCounts := []int64{1, 2, 4, 8, 16}
+
+	for _, count := range concurrencyCounts {
+		b.Run(string("Concurrency"+string(rune(count+'0'))), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				if err := UsingSemaphoreWithGoroutines(count); err != nil {
 					b.Fatal(err)
 				}
 			}
