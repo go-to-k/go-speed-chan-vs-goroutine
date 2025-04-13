@@ -27,7 +27,15 @@ func ChannelWithUnlimitedParallelism() error {
         for task := range tasks {
             task := task // ループ変数をキャプチャ
             eg.Go(func() error {
-                return processTask(task)
+                select {
+                case <-ctx.Done():
+                    return ctx.Err()
+                default:
+                    if err := processTask(task); err != nil {
+                        log.Printf("Error processing task %d: %v", task.ID, err)
+                    }
+                    return nil
+                }
             })
         }
         // すべてのタスク処理が完了するのを待つ
@@ -36,7 +44,10 @@ func ChannelWithUnlimitedParallelism() error {
 
     // タスクをチャネルに送信
     for i := 0; i < numTasks; i++ {
-        tasks <- Task{ID: i}
+        tasks <- Task{
+            ID:   i,
+            Data: fmt.Sprintf("Task data %d", i),
+        }
     }
     
     close(tasks)
@@ -55,11 +66,19 @@ func DirectGoroutineWithUnlimitedParallelism() error {
     
     // タスクごとに直接goroutineを起動
     for i := 0; i < numTasks; i++ {
-        i := i
-        task := Task{ID: i}
+        i := i // ループ変数をキャプチャ
+        task := Task{
+            ID:   i,
+            Data: fmt.Sprintf("Task data %d", i),
+        }
         
         eg.Go(func() error {
-            return processTask(task)
+            select {
+            case <-ctx.Done():
+                return ctx.Err()
+            default:
+                return processTask(task)
+            }
         })
     }
     
@@ -97,17 +116,31 @@ func ChannelWithLimitedParallelism(numWorkers int) error {
             // errgroup.Goを使用してタスク処理を実行（semaphoreで制限）
             eg.Go(func() error {
                 defer sem.Release(1) // 処理完了時にsemaphoreを解放
-                return processTask(task)
+                
+                select {
+                case <-ctx.Done():
+                    return ctx.Err()
+                default:
+                    if err := processTask(task); err != nil {
+                        log.Printf("Error processing task %d: %v", task.ID, err)
+                    }
+                    return nil
+                }
             })
         }
         
         // すべてのタスク処理が完了するのを待つ
-        eg.Wait()
+        if err := eg.Wait(); err != nil {
+            log.Printf("Error in worker: %v", err)
+        }
     }()
 
     // タスクをチャネルに送信
     for i := 0; i < numTasks; i++ {
-        tasks <- Task{ID: i}
+        tasks <- Task{
+            ID:   i,
+            Data: fmt.Sprintf("Task data %d", i),
+        }
     }
     
     close(tasks)
@@ -131,8 +164,11 @@ func DirectGoroutineWithLimitedParallelism(maxConcurrency int64) error {
     
     // タスクごとにgoroutineを起動（semaphoreで同時実行数を制限）
     for i := 0; i < numTasks; i++ {
-        i := i
-        task := Task{ID: i}
+        i := i // ループ変数をキャプチャ
+        task := Task{
+            ID:   i,
+            Data: fmt.Sprintf("Task data %d", i),
+        }
         
         // semaphoreの空きを待つ
         if err := sem.Acquire(ctx, 1); err != nil {
@@ -143,7 +179,10 @@ func DirectGoroutineWithLimitedParallelism(maxConcurrency int64) error {
         go func() {
             defer sem.Release(1)
             defer wg.Done()
-            processTask(task)
+            
+            if err := processTask(task); err != nil {
+                log.Printf("Error processing task %d: %v", task.ID, err)
+            }
         }()
     }
     
@@ -184,6 +223,8 @@ go test -bench=. -benchmem ./benchmark
 
 ### 基本実行結果（`go run main.go`）- 10万タスク処理
 
+この基本実行では、環境のCPU数（12）に基づいて制限付きの並列処理を行っています。
+
 ```
 CPUs: 12
 処理タスク数: 100000
@@ -203,6 +244,8 @@ CPUs: 12
 
 ### 詳細なベンチマーク結果（`go test -bench=. -benchmem ./benchmark`）- 10万タスク処理
 
+ベンチマークでは様々な同時実行数（1, 2, 4, 8, 16）でテストを行い、より詳細な性能特性を測定しています。
+
 ```
 goos: darwin
 goarch: arm64
@@ -215,13 +258,13 @@ BenchmarkChannelWithLimitedParallelismVaryingWorkers/Workers1-12        1       
 BenchmarkChannelWithLimitedParallelismVaryingWorkers/Workers2-12        1        1066918000 ns/op        36658024 B/op     796845 allocs/op
 BenchmarkChannelWithLimitedParallelismVaryingWorkers/Workers4-12        2         538092833 ns/op        36130172 B/op     787916 allocs/op
 BenchmarkChannelWithLimitedParallelismVaryingWorkers/Workers8-12        4         283978552 ns/op        33360754 B/op     740752 allocs/op
-BenchmarkChannelWithLimitedParallelismVaryingWorkers/Workers@-12        7         156329309 ns/op        28552453 B/op     658806 allocs/op
+BenchmarkChannelWithLimitedParallelismVaryingWorkers/Workers16-12       7         156329309 ns/op        28552453 B/op     658806 allocs/op
 BenchmarkDirectGoroutineWithLimitedParallelism/DefaultConcurrency-12    6         190699479 ns/op        26953154 B/op     599819 allocs/op
 BenchmarkDirectGoroutineWithVaryingConcurrency/Concurrency1-12          1        2193692833 ns/op        32824248 B/op     699822 allocs/op
 BenchmarkDirectGoroutineWithVaryingConcurrency/Concurrency2-12          1        1068082833 ns/op        32731688 B/op     698224 allocs/op
 BenchmarkDirectGoroutineWithVaryingConcurrency/Concurrency4-12          2         526788021 ns/op        32097764 B/op     687468 allocs/op
 BenchmarkDirectGoroutineWithVaryingConcurrency/Concurrency8-12          4         266741386 ns/op        29688570 B/op     646416 allocs/op
-BenchmarkDirectGoroutineWithVaryingConcurrency/Concurrency@-12          7         149002119 ns/op        24991408 B/op     566385 allocs/op
+BenchmarkDirectGoroutineWithVaryingConcurrency/Concurrency16-12         7         149002119 ns/op        24991408 B/op     566385 allocs/op
 ```
 
 ### 結果の分析
@@ -237,16 +280,30 @@ BenchmarkDirectGoroutineWithVaryingConcurrency/Concurrency@-12          7       
    - アロケーション数: 約499,867回（アプローチ1とほぼ同等）
 
 3. **アプローチ3（チャネル + 単一ディスパッチャー + 制限付き並列処理）**:
-   - 処理時間: 約156.3ms（16同時実行時）
-   - メモリ使用量: 約28.6MB（アプローチ1・2の約1.6倍）
-   - アロケーション数: 約658,806回（アプローチ1・2の約1.3倍）
-   - 同時実行数を増やすほど処理時間は短縮される（1→16で約14倍高速化）
+   - 基本実行（12同時実行時）: 約211.7ms
+   - ベンチマーク結果:
+     - 1同時実行: 約2241ms
+     - 4同時実行: 約538ms
+     - 8同時実行: 約284ms
+     - 16同時実行: 約156.3ms（1同時実行と比較して約14倍高速）
+   - メモリ使用量（16同時実行時）: 約28.6MB
+   - アロケーション数（16同時実行時）: 約658,806回
+   - 同時実行数を増やすほど処理時間は短縮される
 
 4. **アプローチ4（直接goroutine起動 + 制限付き並列処理）**:
-   - 処理時間: 約149.0ms（16同時実行時）
-   - メモリ使用量: 約25.0MB（アプローチ1・2よりも多い）
-   - アロケーション数: 約566,385回（アプローチ1・2よりも多い）
-   - 同時実行数を増やすほど処理時間は短縮される（1→16で約15倍高速化）
+   - 基本実行（12同時実行時）: 約191.2ms
+   - ベンチマーク結果:
+     - 1同時実行: 約2194ms
+     - 4同時実行: 約527ms
+     - 8同時実行: 約267ms
+     - 16同時実行: 約149.0ms（1同時実行と比較して約15倍高速）
+   - メモリ使用量（16同時実行時）: 約25.0MB
+   - アロケーション数（16同時実行時）: 約566,385回
+   - 同時実行数を増やすほど処理時間は短縮される
+
+**同時実行数の比較（アプローチ3 vs アプローチ4）**:
+- 12同時実行時（基本実行）: アプローチ4が約10%高速
+- 16同時実行時（ベンチマーク）: アプローチ4が約5%高速
 
 ## 結果の解釈
 
@@ -270,7 +327,7 @@ BenchmarkDirectGoroutineWithVaryingConcurrency/Concurrency@-12          7       
 
 4. **直接goroutine起動 + 制限付き並列処理**：
    - 同時実行数を制限することで、システムリソースの使用を抑制しつつ、チャネルベースのアプローチよりも高速に動作します
-   - 同様の並列度設定では、チャネルを使用するアプローチよりも約20%高速です
+   - 同様の並列度設定では、チャネルを使用するアプローチよりも約5-10%高速です
    - 大量のタスクを処理する必要がある場合で、かつシステムリソースに制約がある場合に最適です
 
 ## 結論
