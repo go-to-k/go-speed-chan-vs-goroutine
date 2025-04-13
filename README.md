@@ -2,26 +2,26 @@
 
 このリポジトリでは、Goにおける複数の並行処理アプローチのパフォーマンスを比較します：
 
-1. 事前に1つのgoroutineを起動してチャネル経由でタスクを受け取り、各タスクをerrgroup.Goで処理する方法
-2. ループ内で都度goroutineを起動してタスクを処理する方法（errgroup使用）
-3. ワーカープールとチャネルを使った方法（比較用）
-4. semaphoreを使用してgoroutineの同時実行数を制限する方法
+1. チャネル + 単一ディスパッチャー + 無制限の並列処理（errgroup.Go）
+2. 直接goroutine起動 + 無制限の並列処理（errgroup.Go）
+3. チャネル + 単一ディスパッチャー + 制限付き並列処理（errgroup.Go + semaphore）
+4. 直接goroutine起動 + 制限付き並列処理（semaphore）
 
 ## 実装の比較
 
-### アプローチ1: シングルワーカーとチャネル（タスク処理はerrgroup.Goで実行）
+### アプローチ1: チャネル + 単一ディスパッチャー + 無制限の並列処理
 
-このアプローチでは、1つのワーカーgoroutineを事前に起動し、チャネルを通じてタスクを受信します。ワーカーはチャネルからタスクを受け取り、各タスクをerrgroup.Goを使用して処理します。
+このアプローチでは、1つのディスパッチャーgoroutineがチャネルからタスクを受け取り、各タスクをerrgroup.Goを使用して並列処理します。並列度に制限はありません。
 
 ```go
-func UsingSingleWorkerWithChannel() error {
+func ChannelWithUnlimitedParallelism() error {
     tasks := make(chan Task, 100)
     done := make(chan struct{})
     
     // errgroupを作成
     eg, ctx := errgroup.WithContext(context.Background())
     
-    // 1つのワーカーgoroutineを起動
+    // ディスパッチャーgoroutineを起動
     go func() {
         defer close(done)
         for task := range tasks {
@@ -45,15 +45,15 @@ func UsingSingleWorkerWithChannel() error {
 }
 ```
 
-### アプローチ2: タスクごとにGoroutineを起動
+### アプローチ2: 直接goroutine起動 + 無制限の並列処理
 
-このアプローチでは、タスクごとに新しいgoroutineを起動します。`golang.org/x/sync/errgroup`パッケージを使用して、複数のgoroutineを管理し、エラーハンドリングを容易にします。
+このアプローチでは、タスクごとに直接errgroup.Goを使用してgoroutineを起動します。並列度に制限はありません。
 
 ```go
-func UsingGoroutinePerTask() error {
+func DirectGoroutineWithUnlimitedParallelism() error {
     eg, ctx := errgroup.WithContext(context.Background())
     
-    // タスクごとにgoroutineを起動
+    // タスクごとに直接goroutineを起動
     for i := 0; i < numTasks; i++ {
         i := i
         task := Task{ID: i}
@@ -67,25 +67,43 @@ func UsingGoroutinePerTask() error {
 }
 ```
 
-### アプローチ3: ワーカープールとチャネル
+### アプローチ3: チャネル + 単一ディスパッチャー + 制限付き並列処理
 
-このアプローチでは、固定数のワーカーgoroutineを事前に起動し、チャネルを通じてタスクを分配します。各ワーカーはチャネルからタスクを受け取り、処理します。
+このアプローチでは、1つのディスパッチャーgoroutineがチャネルからタスクを受け取り、semaphoreで並列度を制限しつつerrgroup.Goを使用して処理します。
 
 ```go
-func UsingWorkerPoolWithChannel(numWorkers int) error {
+func ChannelWithLimitedParallelism(numWorkers int) error {
     tasks := make(chan Task, 100)
-    var wg sync.WaitGroup
+    done := make(chan struct{})
     
-    // 複数のワーカーgoroutineを起動
-    for w := 0; w < numWorkers; w++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            for task := range tasks {
-                processTask(task)
+    // errgroupを作成
+    eg, ctx := errgroup.WithContext(context.Background())
+    
+    // semaphoreを作成して並列度を制限
+    sem := semaphore.NewWeighted(int64(numWorkers))
+    
+    // ディスパッチャーgoroutineを起動
+    go func() {
+        defer close(done)
+        for task := range tasks {
+            task := task // ループ変数をキャプチャ
+            
+            // semaphoreの空きを待つ
+            if err := sem.Acquire(ctx, 1); err != nil {
+                log.Printf("Failed to acquire semaphore: %v", err)
+                continue
             }
-        }()
-    }
+            
+            // errgroup.Goを使用してタスク処理を実行（semaphoreで制限）
+            eg.Go(func() error {
+                defer sem.Release(1) // 処理完了時にsemaphoreを解放
+                return processTask(task)
+            })
+        }
+        
+        // すべてのタスク処理が完了するのを待つ
+        eg.Wait()
+    }()
 
     // タスクをチャネルに送信
     for i := 0; i < numTasks; i++ {
@@ -93,17 +111,17 @@ func UsingWorkerPoolWithChannel(numWorkers int) error {
     }
     
     close(tasks)
-    wg.Wait()
+    <-done
     return nil
 }
 ```
 
-### アプローチ4: Semaphoreを使用した同時実行制限
+### アプローチ4: 直接goroutine起動 + 制限付き並列処理
 
-このアプローチでは、`golang.org/x/sync/semaphore`パッケージを使用して、同時に実行されるgoroutineの数を制限します。タスクごとに新しいgoroutineを起動しつつも、システムリソースの使用を制御できます。
+このアプローチでは、タスクごとに直接goroutineを起動しますが、semaphoreを使用して同時実行数を制限します。
 
 ```go
-func UsingSemaphoreWithGoroutines(maxConcurrency int64) error {
+func DirectGoroutineWithLimitedParallelism(maxConcurrency int64) error {
     ctx := context.Background()
     
     // 同時実行数を制限するsemaphoreを作成
@@ -153,10 +171,10 @@ go run main.go
 go test -bench=. ./benchmark
 
 # 特定のベンチマークを実行
-go test -bench=BenchmarkSingleWorkerWithChannel ./benchmark
-go test -bench=BenchmarkGoroutinePerTask ./benchmark
-go test -bench=BenchmarkWorkerPoolWithChannel ./benchmark
-go test -bench=BenchmarkSemaphoreWithGoroutines ./benchmark
+go test -bench=BenchmarkChannelWithUnlimitedParallelism ./benchmark
+go test -bench=BenchmarkDirectGoroutineWithUnlimitedParallelism ./benchmark
+go test -bench=BenchmarkChannelWithLimitedParallelism ./benchmark
+go test -bench=BenchmarkDirectGoroutineWithLimitedParallelism ./benchmark
 
 # 詳細なメモリ統計情報も表示
 go test -bench=. -benchmem ./benchmark
@@ -164,94 +182,110 @@ go test -bench=. -benchmem ./benchmark
 
 ## ベンチマーク結果
 
-### 基本実行結果（`go run main.go`）
+### 基本実行結果（`go run main.go`）- 10万タスク処理
 
 ```
 CPUs: 12
-処理タスク数: 10000
+処理タスク数: 100000
 
-1. 事前に1つのgoroutineを起動してチャネル経由でタスクを受け取り、errgroup.Goで並列処理
-処理時間: 7.516ms
+1. チャネル + 単一ディスパッチャー + 無制限の並列処理（errgroup.Go）
+処理時間: 66.810625ms
 
-2. ループ内でgoroutineを毎回起動
-処理時間: 6.686084ms
+2. 直接goroutine起動 + 無制限の並列処理（errgroup.Go）
+処理時間: 54.73025ms
 
-3. 12個のワーカープールを使用したチャネル実装
-処理時間: 18.977ms
+3. チャネル + 単一ディスパッチャー + 制限付き並列処理（errgroup.Go + semaphore、12同時実行）
+処理時間: 211.657667ms
 
-4. semaphoreを使用して同時実行数を12に制限
-処理時間: 19.860708ms
+4. 直接goroutine起動 + 制限付き並列処理（semaphore、12同時実行）
+処理時間: 191.222584ms
 ```
 
-### 詳細なベンチマーク結果（`go test -bench=. -benchmem ./benchmark`）
+### 詳細なベンチマーク結果（`go test -bench=. -benchmem ./benchmark`）- 10万タスク処理
 
 ```
 goos: darwin
 goarch: arm64
 pkg: github.com/go-to-k/go-speed-chan-vs-goroutine/benchmark
 cpu: Apple M2 Pro
-BenchmarkSingleWorkerWithChannel-12                          195           6118184 ns/op         1763846 B/op          49767 allocs/op
-BenchmarkGoroutinePerTask-12                                 223           4959157 ns/op         1760949 B/op          49762 allocs/op
-BenchmarkWorkerPoolWithChannel/4Workers-12                    22          50556850 ns/op          241410 B/op          19755 allocs/op
-BenchmarkWorkerPoolWithChannelVaryingWorkers/Workers1-12       5         211595183 ns/op          241235 B/op          19749 allocs/op
-BenchmarkWorkerPoolWithChannelVaryingWorkers/Workers2-12      10         102134692 ns/op          241180 B/op          19751 allocs/op
-BenchmarkWorkerPoolWithChannelVaryingWorkers/Workers4-12      21          50768460 ns/op          241432 B/op          19755 allocs/op
-BenchmarkWorkerPoolWithChannelVaryingWorkers/Workers8-12      43          24966724 ns/op          241811 B/op          19763 allocs/op
-BenchmarkWorkerPoolWithChannelVaryingWorkers/Workers@-12      88          14955557 ns/op          242674 B/op          19780 allocs/op
-BenchmarkSemaphoreWithGoroutines/DefaultConcurrency-12                61          18934442 ns/op         2698816 B/op          59839 allocs/op
-BenchmarkSemaphoreWithVaryingConcurrency/Concurrency1-12               5         218344800 ns/op         3280139 B/op          69749 allocs/op
-BenchmarkSemaphoreWithVaryingConcurrency/Concurrency2-12              10         108389938 ns/op         3269420 B/op          69565 allocs/op
-BenchmarkSemaphoreWithVaryingConcurrency/Concurrency4-12              22          52402504 ns/op         3210457 B/op          68563 allocs/op
-BenchmarkSemaphoreWithVaryingConcurrency/Concurrency8-12              42          27283199 ns/op         2955147 B/op          64212 allocs/op
-BenchmarkSemaphoreWithVaryingConcurrency/Concurrency@-12              82          15012667 ns/op         2514693 B/op          56709 allocs/op
+BenchmarkChannelWithUnlimitedParallelism-12                 18          60649912 ns/op        17629422 B/op         499912 allocs/op
+BenchmarkDirectGoroutineWithUnlimitedParallelism-12         22          52495205 ns/op        17623392 B/op         499867 allocs/op
+BenchmarkChannelWithLimitedParallelism/4Workers-12           2         543696062 ns/op        36035956 B/op         786291 allocs/op
+BenchmarkChannelWithLimitedParallelismVaryingWorkers/Workers1-12        1        2240980792 ns/op        36833800 B/op     799854 allocs/op
+BenchmarkChannelWithLimitedParallelismVaryingWorkers/Workers2-12        1        1066918000 ns/op        36658024 B/op     796845 allocs/op
+BenchmarkChannelWithLimitedParallelismVaryingWorkers/Workers4-12        2         538092833 ns/op        36130172 B/op     787916 allocs/op
+BenchmarkChannelWithLimitedParallelismVaryingWorkers/Workers8-12        4         283978552 ns/op        33360754 B/op     740752 allocs/op
+BenchmarkChannelWithLimitedParallelismVaryingWorkers/Workers@-12        7         156329309 ns/op        28552453 B/op     658806 allocs/op
+BenchmarkDirectGoroutineWithLimitedParallelism/DefaultConcurrency-12    6         190699479 ns/op        26953154 B/op     599819 allocs/op
+BenchmarkDirectGoroutineWithVaryingConcurrency/Concurrency1-12          1        2193692833 ns/op        32824248 B/op     699822 allocs/op
+BenchmarkDirectGoroutineWithVaryingConcurrency/Concurrency2-12          1        1068082833 ns/op        32731688 B/op     698224 allocs/op
+BenchmarkDirectGoroutineWithVaryingConcurrency/Concurrency4-12          2         526788021 ns/op        32097764 B/op     687468 allocs/op
+BenchmarkDirectGoroutineWithVaryingConcurrency/Concurrency8-12          4         266741386 ns/op        29688570 B/op     646416 allocs/op
+BenchmarkDirectGoroutineWithVaryingConcurrency/Concurrency@-12          7         149002119 ns/op        24991408 B/op     566385 allocs/op
 ```
 
 ### 結果の分析
 
-1. **アプローチ1（シングルワーカー + チャネル + errgroup.Go）**:
-   - 処理時間: 約6.1ms
-   - メモリ使用量: 約1.76MB
-   - アロケーション数: 約49,767回
+1. **アプローチ1（チャネル + 単一ディスパッチャー + 無制限の並列処理）**:
+   - 処理時間: 約60.6ms
+   - メモリ使用量: 約17.6MB
+   - アロケーション数: 約499,912回
 
-2. **アプローチ2（タスクごとにgoroutine）**:
-   - 処理時間: 約5.0ms（アプローチ1より約20%高速）
-   - メモリ使用量: 約1.76MB（アプローチ1とほぼ同等）
-   - アロケーション数: 約49,762回（アプローチ1とほぼ同等）
+2. **アプローチ2（直接goroutine起動 + 無制限の並列処理）**:
+   - 処理時間: 約52.5ms（アプローチ1より約15%高速）
+   - メモリ使用量: 約17.6MB（アプローチ1とほぼ同等）
+   - アロケーション数: 約499,867回（アプローチ1とほぼ同等）
 
-3. **ワーカープール方式（4ワーカー）**:
-   - 処理時間: 約50.6ms（アプローチ1の約8倍、アプローチ2の約10倍遅い）
-   - メモリ使用量: 約241KB（アプローチ1・2の約14%程度）
-   - アロケーション数: 約19,755回（アプローチ1・2の約40%程度）
+3. **アプローチ3（チャネル + 単一ディスパッチャー + 制限付き並列処理）**:
+   - 処理時間: 約156.3ms（16同時実行時）
+   - メモリ使用量: 約28.6MB（アプローチ1・2の約1.6倍）
+   - アロケーション数: 約658,806回（アプローチ1・2の約1.3倍）
+   - 同時実行数を増やすほど処理時間は短縮される（1→16で約14倍高速化）
 
-4. **アプローチ4（Semaphoreによる同時実行制限）**:
-   - 処理時間: 約19ms（同時実行数12の場合）
-   - メモリ使用量: 約2.7MB（アプローチ1・2よりも多い）
-   - アロケーション数: 約59,839回（アプローチ1・2よりも多い）
-   - 同時実行数を増やすほど処理時間は短縮され、メモリ使用量とアロケーション数は減少する傾向
+4. **アプローチ4（直接goroutine起動 + 制限付き並列処理）**:
+   - 処理時間: 約149.0ms（16同時実行時）
+   - メモリ使用量: 約25.0MB（アプローチ1・2よりも多い）
+   - アロケーション数: 約566,385回（アプローチ1・2よりも多い）
+   - 同時実行数を増やすほど処理時間は短縮される（1→16で約15倍高速化）
 
 ## 結果の解釈
 
-ベンチマーク結果はシステム環境によって異なりますが、一般的には：
+10万タスク処理のベンチマーク結果から、次のような解釈が可能です：
 
-1. **シングルワーカー+チャネル（errgroup.Go使用）**：
+1. **チャネル + 単一ディスパッチャー + 無制限の並列処理**：
    - チャネルでタスクを一元管理しつつ、各タスクは並列に処理されます
-   - タスクごとにgoroutineを使用するため、メモリ使用量は増加しますが、処理速度は大幅に向上します
-   - タスクキューの制御とタスク処理の並列化を両立させたい場合に適しています
+   - タスクごとにgoroutineを使用するため、多数のタスクを処理する場合でもメモリ使用量は制御されています
+   - ディスパッチャーがチャネルからタスクを読み取るオーバーヘッドがあるため、直接goroutine起動よりやや遅いです
 
-2. **タスクごとのgoroutine**：
-   - 各タスクが独立して並列実行されるため、高速な処理が可能です
-   - シングルワーカー+チャネル（errgroup.Go使用）とほぼ同等のパフォーマンスを示します
-   - コードがシンプルで、タスクキューの管理が不要な場合に適しています
+2. **直接goroutine起動 + 無制限の並列処理**：
+   - タスクが明確に定義されている場合、最も高速な処理が可能です
+   - ディスパッチャーのオーバーヘッドがないため、チャネルを使用するよりも約15%高速です
+   - タスク数が10万になっても、メモリ使用量は約17.6MBと効率的です
+   - システムリソースに余裕がある場合、この方法が最も効率的です
 
-3. **ワーカープール+チャネル**（比較用実装）：
-   - goroutineの数を制限できるため、システムリソースの使用を抑えられます
-   - メモリ効率は良好ですが、他の2つのアプローチと比較すると処理速度は遅くなります
-   - 大量のタスクを処理しながらもシステムリソースの使用を制限したい場合に適しています
+3. **チャネル + 単一ディスパッチャー + 制限付き並列処理**：
+   - 並列度を制限することで、システムリソースの使用を制御できますが、処理速度は無制限の並列処理より大幅に遅くなります
+   - 制限が厳しいほど（同時実行数が少ないほど）処理時間は長くなります
+   - 外部からのタスク入力をキューイングしつつ、システムリソースを制御したい場合に適しています
 
-4. **Semaphoreによる同時実行制限**：
-   - goroutineの数を制限でき、システムリソースの使用を抑制できます
-   - ワーカープール方式とほぼ同等の処理速度ですが、実装がよりシンプルです
-   - タスクごとにgoroutineを作成するため、ワーカープール方式よりもメモリ使用量が多くなります
-   - 大量のタスクをキューイングしつつ処理のスループットを制御したい場合に適しています
+4. **直接goroutine起動 + 制限付き並列処理**：
+   - 同時実行数を制限することで、システムリソースの使用を抑制しつつ、チャネルベースのアプローチよりも高速に動作します
+   - 同様の並列度設定では、チャネルを使用するアプローチよりも約20%高速です
+   - 大量のタスクを処理する必要がある場合で、かつシステムリソースに制約がある場合に最適です
 
-実際の利用シナリオ、タスクの性質（CPU負荷かIO負荷か）、およびシステムのリソース制約に合わせて適切なアプローチを選択してください。 
+## 結論
+
+1. **最高の処理速度を求める場合**：
+   - タスクが事前に全て分かっている場合は「直接goroutine起動 + 無制限の並列処理」が最も高速です
+   - システムリソースに余裕があり、最高のスループットを求める場合に最適です
+
+2. **動的なタスク入力を扱う場合**：
+   - 外部からのタスク入力がある場合は「チャネル + 単一ディスパッチャー」アプローチが適しています
+   - タスクの流入がある程度予測可能で、システムリソースに余裕がある場合は「無制限の並列処理」が、
+   - リソース制約がある場合は「制限付き並列処理」が適しています
+
+3. **リソース使用量に制約がある場合**：
+   - 「直接goroutine起動 + 制限付き並列処理」が、リソース使用を制御しながらも比較的高速な処理を実現します
+   - 処理するタスクの性質やCPUコア数に応じて、最適な同時実行数を選択することが重要です
+
+実際の選択は、アプリケーションの要件、タスクの性質（CPU負荷かIO負荷か）、システム環境、およびスケーラビリティ要件に基づいて行うべきです。最高の結果を得るためには、実際の環境で異なるアプローチをベンチマークすることをお勧めします。 

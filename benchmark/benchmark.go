@@ -13,7 +13,7 @@ import (
 )
 
 // 処理するタスクの数
-const numTasks = 10000
+const numTasks = 100000
 
 // タスクを模擬する構造体
 type Task struct {
@@ -40,7 +40,7 @@ func processTask(task Task) error {
 }
 
 // チャネルを使用した実装：1つのgoroutineを事前に起動
-func UsingSingleWorkerWithChannel() error {
+func ChannelWithUnlimitedParallelism() error {
 	tasks := make(chan Task, 100)
 	done := make(chan struct{})
 
@@ -90,7 +90,7 @@ func UsingSingleWorkerWithChannel() error {
 }
 
 // goroutineをループ内で起動する実装
-func UsingGoroutinePerTask() error {
+func DirectGoroutineWithUnlimitedParallelism() error {
 	// errgroupでgoroutineの実行を管理
 	eg, ctx := errgroup.WithContext(context.Background())
 
@@ -117,22 +117,49 @@ func UsingGoroutinePerTask() error {
 }
 
 // 複数のワーカーを使用するチャネル実装（比較用）
-func UsingWorkerPoolWithChannel(numWorkers int) error {
+func ChannelWithLimitedParallelism(numWorkers int) error {
 	tasks := make(chan Task, 100)
-	var wg sync.WaitGroup
+	done := make(chan struct{})
 
-	// 複数のワーカーgoroutineを起動
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for task := range tasks {
-				if err := processTask(task); err != nil {
-					log.Printf("Error processing task %d: %v", task.ID, err)
-				}
+	// errgroupを作成
+	eg, ctx := errgroup.WithContext(context.Background())
+
+	// semaphoreを作成して並列度を制限
+	sem := semaphore.NewWeighted(int64(numWorkers))
+
+	// ディスパッチャーgoroutineを一つ起動
+	go func() {
+		defer close(done)
+		for task := range tasks {
+			task := task // ループ変数をキャプチャ
+
+			// semaphoreの空きを待つ
+			if err := sem.Acquire(ctx, 1); err != nil {
+				log.Printf("Failed to acquire semaphore: %v", err)
+				continue
 			}
-		}()
-	}
+
+			// errgroup.Goを使用してタスク処理を実行（semaphoreで制限）
+			eg.Go(func() error {
+				defer sem.Release(1) // 処理完了時にsemaphoreを解放
+
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+					if err := processTask(task); err != nil {
+						log.Printf("Error processing task %d: %v", task.ID, err)
+					}
+					return nil
+				}
+			})
+		}
+
+		// すべてのタスク処理が完了するのを待つ
+		if err := eg.Wait(); err != nil {
+			log.Printf("Error in worker: %v", err)
+		}
+	}()
 
 	// タスクをチャネルに送信
 	for i := 0; i < numTasks; i++ {
@@ -146,13 +173,13 @@ func UsingWorkerPoolWithChannel(numWorkers int) error {
 	// タスクの送信が終了したらチャネルを閉じる
 	close(tasks)
 
-	// すべてのワーカーの終了を待つ
-	wg.Wait()
+	// ディスパッチャーの終了を待つ
+	<-done
 	return nil
 }
 
 // semaphoreを使用してgoroutineの同時実行数を制限する実装
-func UsingSemaphoreWithGoroutines(maxConcurrency int64) error {
+func DirectGoroutineWithLimitedParallelism(maxConcurrency int64) error {
 	// コンテキストを作成
 	ctx := context.Background()
 
@@ -196,33 +223,33 @@ func Run() error {
 	fmt.Printf("CPUs: %d\n", runtime.NumCPU())
 	fmt.Printf("処理タスク数: %d\n\n", numTasks)
 
-	fmt.Println("1. 事前に1つのgoroutineを起動してチャネル経由でタスクを受け取り、errgroup.Goで並列処理")
+	fmt.Println("1. チャネル + 単一ディスパッチャー + 無制限の並列処理（errgroup.Go）")
 	start := time.Now()
-	if err := UsingSingleWorkerWithChannel(); err != nil {
+	if err := ChannelWithUnlimitedParallelism(); err != nil {
 		return err
 	}
 	fmt.Printf("処理時間: %v\n\n", time.Since(start))
 
-	fmt.Println("2. ループ内でgoroutineを毎回起動")
+	fmt.Println("2. 直接goroutine起動 + 無制限の並列処理（errgroup.Go）")
 	start = time.Now()
-	if err := UsingGoroutinePerTask(); err != nil {
+	if err := DirectGoroutineWithUnlimitedParallelism(); err != nil {
 		return err
 	}
 	fmt.Printf("処理時間: %v\n\n", time.Since(start))
 
 	// 比較のために複数ワーカーのチャネル実装も実行
 	numWorkers := runtime.NumCPU()
-	fmt.Printf("3. %d個のワーカープールを使用したチャネル実装\n", numWorkers)
+	fmt.Printf("3. チャネル + 単一ディスパッチャー + 制限付き並列処理（errgroup.Go + semaphore、%d同時実行）\n", numWorkers)
 	start = time.Now()
-	if err := UsingWorkerPoolWithChannel(numWorkers); err != nil {
+	if err := ChannelWithLimitedParallelism(numWorkers); err != nil {
 		return err
 	}
 	fmt.Printf("処理時間: %v\n\n", time.Since(start))
 
 	// 4つ目のアプローチ：semaphoreを使用した実装
-	fmt.Printf("4. semaphoreを使用して同時実行数を%dに制限\n", numWorkers)
+	fmt.Printf("4. 直接goroutine起動 + 制限付き並列処理（semaphore、%d同時実行）\n", numWorkers)
 	start = time.Now()
-	if err := UsingSemaphoreWithGoroutines(int64(numWorkers)); err != nil {
+	if err := DirectGoroutineWithLimitedParallelism(int64(numWorkers)); err != nil {
 		return err
 	}
 	fmt.Printf("処理時間: %v\n\n", time.Since(start))
